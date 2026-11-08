@@ -16,20 +16,19 @@ body{margin:0;background:var(--bg);color:var(--green);font-family:"Courier New",
 .err{color:#ff5555}
 #bar{padding:8px 12px;border-top:1px solid var(--dark);border-bottom:1px solid var(--dark);font-size:12px;color:var(--dim);display:flex;justify-content:space-between;gap:10px}
 #form{display:flex;gap:8px;padding:10px;background:#000}
-#msg{flex:1;min-width:0;background:#000;border:1px solid var(--dim);color:var(--green);font-family:inherit;font-size:16px;padding:12px;outline:none}
+#msg{flex:1;min-width:0;background:#000;border:1px solid var(--dim);color:var(--green);font-family:inherit;font-size:15px;padding:11px;outline:none}
 #msg:focus{border-color:var(--green)}
-#send{background:#001a0c;border:1px solid var(--green);color:var(--green);font-family:inherit;padding:12px 16px;cursor:pointer}
+#send{background:#001a0c;border:1px solid var(--green);color:var(--green);font-family:inherit;padding:11px 16px;cursor:pointer}
 #send:hover{background:var(--green);color:#000}
 #login{position:fixed;inset:0;background:#000;display:flex;align-items:center;justify-content:center;padding:18px;z-index:10}
 #box{width:100%;max-width:430px;border:1px solid var(--dim);padding:20px}
 #box h1{font-size:17px;margin:0 0 6px;letter-spacing:1px}
 #box p{margin:0 0 16px;color:var(--dim);font-size:12px}
-#box input{width:100%;background:#000;border:1px solid var(--dim);color:var(--green);font-family:inherit;font-size:16px;padding:12px;margin-bottom:10px;outline:none}
+#box input{width:100%;background:#000;border:1px solid var(--dim);color:var(--green);font-family:inherit;font-size:15px;padding:11px;margin-bottom:10px;outline:none}
 #box input:focus{border-color:var(--green)}
-#box button{width:100%;background:#001a0c;border:1px solid var(--green);color:var(--green);font-family:inherit;padding:12px;cursor:pointer}
+#box button{width:100%;background:#001a0c;border:1px solid var(--green);color:var(--green);font-family:inherit;padding:11px;cursor:pointer}
 #box button:hover{background:var(--green);color:#000}
 #note{margin-top:12px;font-size:11px;color:var(--dim)}
-#diag{margin-top:10px;font-size:11px;color:#ff8888;white-space:pre-wrap}
 </style>
 </head>
 <body>
@@ -37,12 +36,11 @@ body{margin:0;background:var(--bg);color:var(--green);font-family:"Courier New",
 <div id="login">
   <div id="box">
     <h1>CANAL PRIVE // TERMINAL</h1>
-    <p>Entrez le meme code secret sur les deux appareils. La connexion Internet est necessaire.</p>
-    <input id="code" type="password" placeholder="CODE SECRET" autocomplete="off">
+    <p>Meme code secret sur les deux appareils, mais un pseudo different sur chacun.</p>
+    <input id="code" type="password" placeholder="CODE SECRET (long, difficile a deviner)" autocomplete="off">
     <input id="pseudo" placeholder="TON PSEUDO" autocomplete="off">
     <button id="enter">SE CONNECTER</button>
-    <div id="note">Les messages restent dans l'historique de cet appareil et ne peuvent pas etre supprimes depuis l'application.</div>
-    <div id="diag"></div>
+    <div id="note">Les messages sont chiffres de bout en bout. Ils restent dans l'historique de cet appareil et ne peuvent pas etre supprimes depuis l'application.</div>
   </div>
 </div>
 
@@ -53,117 +51,148 @@ body{margin:0;background:var(--bg);color:var(--green);font-family:"Courier New",
   <button id="send" type="submit">ENVOYER</button>
 </form>
 
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
 <script>
-const NTFY='https://ntfy.sh';
-const screen=document.getElementById('screen');
+const BROKERS=[
+  'wss://broker.emqx.io:8084/mqtt',
+  'wss://broker.hivemq.com:8884/mqtt',
+  'wss://test.mosquitto.org:8081/mqtt'
+];
+
+const screenEl=document.getElementById('screen');
 const statusEl=document.getElementById('status');
 const channelEl=document.getElementById('channel');
 const form=document.getElementById('form');
 const input=document.getElementById('msg');
-const diag=document.getElementById('diag');
-let source=null, topic='', pseudo='', code='';
+const myId=Math.random().toString(36).slice(2)+Date.now().toString(36);
+let client=null, topic='', pseudo='', code='', key=null, brokerIndex=0;
+
+const enc=new TextEncoder(), dec=new TextDecoder();
+const b64=buf=>btoa(String.fromCharCode(...new Uint8Array(buf)));
+const unb64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
 
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function now(){return new Date().toLocaleString('fr-FR')}
 
 function addLine(html,cls=''){
   const d=document.createElement('div');
   d.className='line '+cls;
   d.innerHTML=html;
-  screen.appendChild(d);
-  screen.scrollTop=screen.scrollHeight;
+  screenEl.appendChild(d);
+  screenEl.scrollTop=screenEl.scrollHeight;
 }
-
-function now(){return new Date().toLocaleString('fr-FR')}
-
-function saveHistory(list){
-  try{localStorage.setItem('terminal_history_'+code,JSON.stringify(list))}catch(e){}
-}
-
-function loadHistory(){
-  try{return JSON.parse(localStorage.getItem('terminal_history_'+code)||'[]')}catch{return[]}
-}
-
-function addMessage(author,text,time){
-  const history=loadHistory();
-  history.push({author,text,time});
-  saveHistory(history);
+function renderMessage(author,text,time){
   addLine('<span class="meta">['+esc(time)+']</span> <span class="meta">'+esc(author)+':</span> '+esc(text));
 }
-
 function addSystem(text,cls='sys'){
   addLine('<span class="meta">['+now()+']</span> [SYSTEME] '+esc(text),cls);
 }
 
-function hash(text){
-  let h=5381;
-  for(let i=0;i<text.length;i++){h=((h<<5)+h+text.charCodeAt(i))>>>0}
-  return h.toString(36);
+function loadHistory(){
+  try{return JSON.parse(localStorage.getItem('terminal_history_'+topic)||'[]')}catch(e){return[]}
+}
+function saveMessage(author,text,time){
+  try{
+    const h=loadHistory();
+    h.push({author,text,time});
+    localStorage.setItem('terminal_history_'+topic,JSON.stringify(h));
+  }catch(e){}
 }
 
-function disconnect(){
-  if(source){try{source.close()}catch(e){}}
-  source=null;
-  statusEl.textContent='HORS LIGNE';
+// Le canal (topic) est un hash du code : le code ne peut pas etre relu par un tiers.
+// Les messages sont chiffres en AES-GCM avec une cle derivee du code.
+async function setupCrypto(){
+  const hash=await crypto.subtle.digest('SHA-256',enc.encode('topic:'+code));
+  topic='canal-prive-terminal/'+[...new Uint8Array(hash)].map(b=>b.toString(16).padStart(2,'0')).join('').slice(0,32);
+  const base=await crypto.subtle.importKey('raw',enc.encode(code),'PBKDF2',false,['deriveKey']);
+  key=await crypto.subtle.deriveKey(
+    {name:'PBKDF2',salt:enc.encode('canal-prive-v1'),iterations:100000,hash:'SHA-256'},
+    base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+}
+async function encrypt(obj){
+  const iv=crypto.getRandomValues(new Uint8Array(12));
+  const ct=await crypto.subtle.encrypt({name:'AES-GCM',iv},key,enc.encode(JSON.stringify(obj)));
+  return JSON.stringify({iv:b64(iv),d:b64(ct)});
+}
+async function decrypt(str){
+  const o=JSON.parse(str);
+  const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv:unb64(o.iv)},key,unb64(o.d));
+  return JSON.parse(dec.decode(pt));
 }
 
-function connect(){
+function startClient(){
+  const url=BROKERS[brokerIndex%BROKERS.length];
+  statusEl.textContent='CONNEXION...';
+  let connected=false, finished=false;
+  const c=mqtt.connect(url,{
+    clientId:'terminal_'+Math.random().toString(16).slice(2),
+    clean:true,reconnectPeriod:0,connectTimeout:8000
+  });
+  client=c;
+
+  c.on('connect',()=>{
+    connected=true;
+    c.subscribe(topic,{qos:1},err=>{
+      if(err){addSystem('ABONNEMENT IMPOSSIBLE : '+err.message,'err');return}
+      statusEl.textContent='EN LIGNE';
+      addSystem('CANAL PRIVE ACTIF ('+url.split('/')[2]+').');
+    });
+  });
+
+  c.on('message',async(_,payload)=>{
+    try{
+      const data=await decrypt(payload.toString());
+      if(data.id===myId)return; // mes propres messages (renvoyes par le relais)
+      const time=now();
+      saveMessage(data.p,data.t,time);
+      renderMessage(data.p,data.t,time);
+    }catch(e){} // message d'un autre canal ou illisible : ignore
+  });
+
+  c.on('error',e=>{if(!connected)addSystem('ERREUR RELAIS '+url.split('/')[2]+' : '+(e&&e.message||'inconnue'),'err')});
+
+  c.on('close',()=>{
+    if(finished)return;
+    finished=true;
+    c.end(true);
+    if(connected){
+      statusEl.textContent='RECONNEXION...';
+      setTimeout(startClient,3000);
+    }else{
+      brokerIndex++;
+      if(brokerIndex<BROKERS.length){
+        addSystem('RELAIS INDISPONIBLE, ESSAI DU SUIVANT...','err');
+        startClient();
+      }else{
+        statusEl.textContent='HORS LIGNE';
+        addSystem('AUCUN RELAIS DISPONIBLE. VERIFIE TA CONNEXION ET RECHARGE LA PAGE.','err');
+      }
+    }
+  });
+}
+
+async function connect(){
   code=document.getElementById('code').value.trim();
   pseudo=document.getElementById('pseudo').value.trim();
-  diag.textContent='';
-
-  if(!code||!pseudo){diag.textContent='ERREUR : entre un code secret et un pseudo.';return}
-  if(!navigator.onLine){diag.textContent='ERREUR : aucun acces Internet detecte.';return}
-
-  localStorage.setItem('terminal_last_code',code);
-  localStorage.setItem('terminal_last_pseudo',pseudo);
-
-  topic='canal-terminal-prive-'+hash(code);
-  document.getElementById('login').style.display='none';
-  channelEl.textContent='CANAL : '+code.slice(0,3)+'...'+code.slice(-3);
-  statusEl.textContent='CONNEXION...';
-
-  disconnect();
+  if(!code||!pseudo){alert('Code secret et pseudo obligatoires.');return}
+  if(!window.crypto||!crypto.subtle){alert('Ouvre la page en HTTPS (lien GitHub Pages).');return}
+  if(typeof mqtt==='undefined'){alert('La bibliotheque MQTT ne s\'est pas chargee. Verifie ta connexion.');return}
 
   try{
-    source=new EventSource(NTFY+'/'+topic+'/sse');
-  }catch(e){
-    diag.textContent='ERREUR : le navigateur a bloque la connexion.\n'+e.message;
-    return;
+    localStorage.setItem('terminal_last_pseudo',pseudo);
+  }catch(e){}
+
+  await setupCrypto();
+  document.getElementById('login').style.display='none';
+  channelEl.textContent='CANAL : '+topic.slice(-6);
+
+  const history=loadHistory();
+  if(history.length){
+    addSystem('HISTORIQUE LOCAL : '+history.length+' MESSAGE(S).');
+    history.forEach(m=>renderMessage(m.author,m.text,m.time));
   }
-
-  source.onopen=()=>{
-    statusEl.textContent='EN LIGNE';
-    addSystem('CANAL PRIVE ACTIF.');
-    addSystem('PSEUDO : '+pseudo);
-    addSystem('LES MESSAGES ENVOYES NE PEUVENT PAS ETRE SUPPRIMES DEPUIS CETTE PAGE.');
-    const history=loadHistory();
-    if(history.length){
-      addSystem('HISTORIQUE LOCAL RESTAURE : '+history.length+' MESSAGE(S).');
-      history.forEach(m=>addLine('<span class="meta">['+esc(m.time)+']</span> <span class="meta">'+esc(m.author)+':</span> '+esc(m.text)));
-    }
-  };
-
-  source.onmessage=event=>{
-    try{
-      const data=JSON.parse(event.data);
-      if(data.event==='message'&&data.message){
-        let text=data.message;
-        let author='INCONNU';
-        try{
-          const parsed=JSON.parse(text);
-          if(parsed&&parsed.pseudo&&typeof parsed.text==='string'){
-            author=parsed.pseudo;
-            text=parsed.text;
-          }
-        }catch(e){}
-        if(author!==pseudo)addMessage(author,text,now());
-      }
-    }catch(e){}
-  };
-
-  source.onerror=()=>{
-    statusEl.textContent='RECONNEXION...';
-  };
+  addSystem('PSEUDO : '+pseudo);
+  startClient();
 }
 
 document.getElementById('enter').onclick=connect;
@@ -174,26 +203,23 @@ form.addEventListener('submit',async e=>{
   e.preventDefault();
   const text=input.value.trim();
   if(!text)return;
-  if(!source||source.readyState!==1){addSystem('PAS CONNECTE : reessaie dans quelques secondes.','err');return}
+  if(!client||!client.connected){addSystem('NON ENVOYE : PAS DE CONNEXION AU RELAIS.','err');return}
   const time=now();
   try{
-    const r=await fetch(NTFY+'/',{
-      method:'POST',
-      headers:{'Topic':topic,'Title':'Message','Tags':'terminal'},
-      body:JSON.stringify({pseudo,text})
+    const payload=await encrypt({id:myId,p:pseudo,t:text});
+    client.publish(topic,payload,{qos:1},err=>{
+      if(err)addSystem('ECHEC DE L\'ENVOI : '+err.message,'err');
     });
-    if(!r.ok){addSystem('ENVOI IMPOSSIBLE : code '+r.status+'.','err');return}
-    addMessage(pseudo,text,time);
+    saveMessage(pseudo,text,time);
+    renderMessage(pseudo,text,time);
     input.value='';
-  }catch(err){
-    addSystem('ENVOI IMPOSSIBLE : verifie ta connexion Internet.','err');
-  }
+  }catch(err){addSystem('ERREUR : '+err.message,'err')}
 });
 
-const lastCode=localStorage.getItem('terminal_last_code');
-const lastPseudo=localStorage.getItem('terminal_last_pseudo');
-if(lastCode)document.getElementById('code').value=lastCode;
-if(lastPseudo)document.getElementById('pseudo').value=lastPseudo;
+try{
+  const lp=localStorage.getItem('terminal_last_pseudo');
+  if(lp)document.getElementById('pseudo').value=lp;
+}catch(e){}
 </script>
 </body>
 </html>
